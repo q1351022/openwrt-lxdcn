@@ -9,7 +9,7 @@
 ## 一键使用
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/q1351022/openwrt-lxdcn/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/q1351022/openwrt-lxdcn/main/openwrt-lxd.sh)
 ```
 
 首次运行后会出现菜单：
