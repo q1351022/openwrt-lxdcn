@@ -1,6 +1,6 @@
 #!/bin/bash set -e
 
-#================= 全局配置 =================
+# ================= 全局配置 =================
 
 WORKDIR="$HOME/openwrt-lxd" IMAGE_ALIAS="openwrt" CONTAINER_NAME="openwrt" SHORTCUT="/usr/local/bin/op" BRIDGE_NAME="br0" CONFIG_FILE="$HOME/.openwrt-lxd.conf"
 
@@ -14,7 +14,7 @@ load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE" fi }
 
 save_config() { cat > "$CONFIG_FILE" <<EOF ENABLE_IPV6=$ENABLE_IPV6 ENABLE_WIFI_SWITCH=$ENABLE_WIFI_SWITCH EOF }
 
-# ================= 多架构支持 =================
+================= 多架构支持 =================
 
 detect_architecture() { case $(uname -m) in x86_64) echo "x86/64" ;; aarch64) echo "armvirt/64" ;; armv7l) echo "armvirt/32" ;; *) echo "unknown" ;; esac }
 
@@ -24,11 +24,11 @@ choose_version() { echo -e "${GREEN}[✓] 可选择 OpenWrt 版本${NC}" echo "1
 
 choose_version IMAGE_FILENAME="openwrt-${VERSION}-${TARGET_PATH////-}-rootfs.tar.gz" IMAGE_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${TARGET_PATH}/${IMAGE_FILENAME}"
 
-# ================= 子网推测 =================
+================= 子网推测 =================
 
 detect_subnet() { local gw=$(ip route | awk '/default/ {print $3}' | head -1) if [[ $gw =~ ^([0-9]+.[0-9]+).([0-9]+).[0-9]+$ ]]; then local base="${BASH_REMATCH[1]}" local third="${BASH_REMATCH[2]}" if (( third < 253 )); then echo "$base.$((third + 1))" return fi fi echo "192.168.2" } DEFAULT_SUBNET=$(detect_subnet)
 
-# ================= 核心功能 =================
+================= 核心功能 =================
 
 check_dependencies() { local missing=() local required=("wget" "tar" "lxd")
 
