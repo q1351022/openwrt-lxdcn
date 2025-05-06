@@ -1,115 +1,156 @@
-#!/bin/bash set -e
+#!/bin/bash
 
-#================= 全局配置 =================
+set -e
 
-WORKDIR="$HOME/openwrt-lxd" IMAGE_ALIAS="openwrt" CONTAINER_NAME="openwrt" SHORTCUT="/usr/local/bin/op" BRIDGE_NAME="br0" CONFIG_FILE="$HOME/.openwrt-lxd.conf"
+# 设置默认参数
+ENABLE_WIFI_SWITCH=true
+ENABLE_IPV6=true
+MODE="主路由"
+USE_LATEST_IMAGE=false
+CUSTOM_GATEWAY=""
+CONTAINER_IP=""
 
-RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' NC='\033[0m'
+# 获取默认网卡名（上网出口）
+DEFAULT_IFACE=$(ip route get 1.1.1.1 | awk '{ for(i=1;i<=NF;i++) if ($i == "dev") print $(i+1) }')
 
-================= 高级功能开关 =================
+# 打印主菜单函数
+function main_menu() {
+    clear
+    echo "=============================="
+    echo " OpenWrt LXD 自动部署脚本"
+    echo "=============================="
+    echo "1. 使用默认镜像部署"
+    echo "2. 使用最新镜像部署"
+    echo "3. 切换为旁路由模式"
+    echo "4. 切换为主路由模式"
+    echo "5. 启用或禁用 Wi-Fi 热点：当前 ${ENABLE_WIFI_SWITCH}"
+    echo "6. 启用或禁用 IPv6 支持：当前 ${ENABLE_IPV6}"
+    echo "7. 设置旁路由参数（网关+容器IP）"
+    echo "0. 开始部署"
+    echo "=============================="
+    echo -n "请输入选项："
+    read opt
+    case $opt in
+        1) USE_LATEST_IMAGE=false;;
+        2) USE_LATEST_IMAGE=true;;
+        3) 
+            MODE="旁路由"
+            read -p "请输入主路由网关IP (如 192.168.1.1): " CUSTOM_GATEWAY
+            CONTAINER_IP="${CUSTOM_GATEWAY%.*}.2"  # 自动生成容器IP
+            echo "容器IP自动设置为: ${CONTAINER_IP}"
+            sleep 2
+            ;;
+        4) MODE="主路由";;
+        5) ENABLE_WIFI_SWITCH=$( [[ $ENABLE_WIFI_SWITCH == true ]] && echo false || echo true );;
+        6) ENABLE_IPV6=$( [[ $ENABLE_IPV6 == true ]] && echo false || echo true );;
+        7)
+            read -p "请输入主路由网关IP (如 192.168.1.1): " CUSTOM_GATEWAY
+            read -p "请输入容器静态IP (如 ${CUSTOM_GATEWAY%.*}.2): " CONTAINER_IP
+            ;;
+        0) deploy_openwrt; return;;
+        *) echo "无效输入，按回车返回..."; read;;
+    esac
+    main_menu
+}
 
-ENABLE_IPV6=false ENABLE_WIFI_SWITCH=false
+# 下载 OpenWrt 镜像
+function fetch_openwrt_image() {
+    if $USE_LATEST_IMAGE; then
+        echo "正在获取 OpenWrt 最新镜像..."
+        URL=$(curl -s https://api.github.com/repos/sbwml/openwrt-x86_64/releases/latest | grep browser_download_url | grep rootfs.tar.gz | cut -d '"' -f 4)
+    else
+        echo "使用默认镜像..."
+        URL="https://github.com/sbwml/openwrt-x86_64/releases/download/2024.03.01/openwrt-x86-64-generic-rootfs.tar.gz"
+    fi
+    wget -O rootfs.tar.gz "$URL"
+}
 
-load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE" fi }
+# 创建并配置 LXD 容器
+function deploy_openwrt() {
+    echo "创建 OpenWrt 容器..."
 
-save_config() { cat > "$CONFIG_FILE" <<EOF ENABLE_IPV6=$ENABLE_IPV6 ENABLE_WIFI_SWITCH=$ENABLE_WIFI_SWITCH EOF }
+    # 安装 lxd
+    if ! command -v lxc >/dev/null; then
+        echo "安装 lxd..."
+        sudo apt update && sudo apt install -y lxd
+        sudo newgrp lxd
+    fi
 
-================= 多架构支持 =================
+    # 初始化 LXD（如果尚未初始化）
+    if ! lxc storage list | grep -q default; then
+        echo "初始化 LXD..."
+        lxd init --auto
+    fi
 
-detect_architecture() { case $(uname -m) in x86_64) echo "x86/64" ;; aarch64) echo "armvirt/64" ;; armv7l) echo "armvirt/32" ;; *) echo "unknown" ;; esac }
+    # 下载镜像
+    fetch_openwrt_image
 
-TARGET_PATH=$(detect_architecture) [ "$TARGET_PATH" = "unknown" ] && { echo -e "${RED}不支持的架构: $(uname -m)${NC}"; exit 1; }
+    # 导入镜像
+    echo "导入 OpenWrt 镜像..."
+    lxc image import rootfs.tar.gz --alias openwrt
 
-choose_version() { echo -e "${GREEN}[✓] 可选择 OpenWrt 版本${NC}" echo "1) 使用默认版本 23.05.3" echo "2) 自动检测最新版本" read -p "请选择: " version_choice case $version_choice in 2) latest_ver=$(wget -qO- https://downloads.openwrt.org/releases/ | grep -oE '2[0-9]+.[0-9]+.[0-9]+' | sort -Vr | head -1) VERSION="$latest_ver" ;; *) VERSION="23.05.3" ;; esac }
+    # 删除已存在容器
+    lxc delete openwrt --force 2>/dev/null || true
 
-choose_version
+    # 创建容器
+    if [[ $MODE == "旁路由" ]]; then
+        # 创建桥接网络配置
+        if ! lxc network show lxdbr-phy &>/dev/null; then
+            lxc network create lxdbr-phy --type=bridge parent=${DEFAULT_IFACE} ipv4.address=none ipv6.address=none
+        fi
+        lxc init openwrt openwrt -n lxdbr-phy
+        lxc config device set openwrt eth0 ipv4.address "${CONTAINER_IP}/24"
+    else
+        lxc init openwrt openwrt
+        lxc network attach lxdbr0 openwrt eth0 eth0
+        lxc config device set openwrt eth0 ipv4.address 192.168.123.2
+    fi
 
-IMAGE_FILENAME="openwrt-${VERSION}-${TARGET_PATH////-}-rootfs.tar.gz" IMAGE_URL="https://downloads.openwrt.org/releases/${VERSION}/targets/${TARGET_PATH}/${IMAGE_FILENAME}"
+    # 启动容器
+    lxc start openwrt
+    sleep 5  # 等待容器启动
 
-================= 子网推测 =================
+    # 基础配置
+    echo "配置基础设置..."
+    lxc exec openwrt -- /bin/sh -c "uci set dropbear.@dropbear[0].enable=1; uci commit dropbear; /etc/init.d/dropbear restart"
 
-detect_subnet() { local gw=$(ip route | awk '/default/ {print $3}' | head -1) if [[ $gw =~ ^([0-9]+.[0-9]+).([0-9]+).[0-9]+$ ]]; then local base="${BASH_REMATCH[1]}" local third="${BASH_REMATCH[2]}" if (( third < 253 )); then echo "$base.$((third + 1))" return fi fi echo "192.168.2" } DEFAULT_SUBNET=$(detect_subnet)
+    # Wi-Fi 热点配置
+    if $ENABLE_WIFI_SWITCH; then
+        echo "启用主机 Wi-Fi 热点..."
+        if ! nmcli device wifi hotspot ifname $DEFAULT_IFACE ssid OpenWrtHotspot password 12345678; then
+            echo "警告：Wi-Fi 热点配置失败，请检查网卡是否支持AP模式"
+        fi
+    fi
 
-================= 核心功能 =================
+    # IPv6 配置
+    if $ENABLE_IPV6; then
+        lxc exec openwrt -- uci set network.lan.ipv6='auto'
+        lxc exec openwrt -- uci commit network
+    fi
 
-check_dependencies() { local missing=() local required=("wget" "tar" "lxd")
+    # 旁路由模式配置
+    if [[ $MODE == "旁路由" ]]; then
+        echo "配置为旁路由模式..."
+        GATEWAY_IP=${CUSTOM_GATEWAY:-192.168.1.1}
+        lxc exec openwrt -- uci set network.lan.gateway=$GATEWAY_IP
+        lxc exec openwrt -- uci set network.lan.dns=$GATEWAY_IP
+        lxc exec openwrt -- uci delete dhcp.lan.dhcp_option || true
+        lxc exec openwrt -- uci set dhcp.lan.ignore=1
+        lxc exec openwrt -- uci commit network
+        lxc exec openwrt -- uci commit dhcp
+        lxc exec openwrt -- /etc/init.d/dnsmasq stop || true
+        lxc exec openwrt -- /etc/init.d/firewall stop || true
+    fi
 
-if ! command -v lxd &>/dev/null; then echo -e "${RED}[!] LXD 未安装${NC}" exit 1 fi
+    # 重启网络服务
+    lxc exec openwrt -- /etc/init.d/network restart
 
-for cmd in "${required[@]}"; do if ! command -v "$cmd" &>/dev/null; then missing+=("$cmd") fi done
+    echo "=============================="
+    echo "部署完成！"
+    [[ $MODE == "旁路由" ]] && echo "旁路由IP: ${CONTAINER_IP}" || echo "主路由IP: 192.168.123.2"
+    echo "SSH访问: ssh root@${CONTAINER_IP:-192.168.123.2}"
+    echo "=============================="
+}
 
-if [ ${#missing[@]} -gt 0 ]; then echo -e "${YELLOW}[!] 缺少依赖: ${missing[*]}${NC}" read -p "自动安装？[Y/n] " confirm [[ ! "$confirm" =~ [nN] ]] && sudo apt update && sudo apt install -y "${missing[@]}" fi
-
-if ! lxc info &>/dev/null; then echo -e "${YELLOW}[~] 自动初始化 LXD...${NC}" cat <<EOF | sudo lxd init --preseed config: core.https_address: '[::]' networks:
-
-name: lxdbr0 type: bridge config: ipv4.address: auto ipv4.nat: true ipv6.address: auto ipv6.nat: true storage_pools:
-
-name: default driver: dir profiles:
-
-name: default config: {} description: "Default LXD profile" devices: root: path: / pool: default type: disk cluster: null EOF fi }
-
-
-init_bridge() { if ip link show "$BRIDGE_NAME" &>/dev/null; then echo -e "${GREEN}[✓] 已存在桥接接口 ${BRIDGE_NAME}${NC}" return fi
-
-default_iface=$(ip route show default 0.0.0.0/0 | awk '{print $5}' | head -1) [ -z "$default_iface" ] && default_iface=$(ls /sys/class/net | grep -vE '^(lo|br0)$' | head -1)
-
-cat <<EOF | sudo tee /etc/netplan/99-openwrt-bridge.yaml >/dev/null network: version: 2 ethernets: $default_iface: dhcp4: true bridges: br0: interfaces: [$default_iface] dhcp4: true EOF
-
-sudo netplan apply echo -e "${GREEN}[✓] 已配置桥接网络 br0（接口: $default_iface）${NC}" }
-
-setup_container() { mkdir -p "$WORKDIR" cd "$WORKDIR"
-
-if [ ! -f "rootfs.tar.gz" ]; then echo -e "${YELLOW}[~] 下载OpenWrt镜像...${NC}" wget -q --show-progress -O rootfs.tar.gz "$IMAGE_URL" fi
-
-if ! lxc image list | grep -q "$IMAGE_ALIAS"; then echo -e "${YELLOW}[~] 导入容器镜像...${NC}" cat > metadata.yaml <<EOF architecture: "$(uname -m)" creation_date: $(date +%s) properties: description: "OpenWrt $VERSION" os: "OpenWrt" release: "$VERSION" EOF tar -czf openwrt-lxd.tar.gz metadata.yaml rootfs.tar.gz lxc image import openwrt-lxd.tar.gz --alias "$IMAGE_ALIAS" fi
-
-if ! lxc list | grep -q "$CONTAINER_NAME"; then echo -e "${YELLOW}[~] 初始化容器...${NC}" lxc launch "$IMAGE_ALIAS" "$CONTAINER_NAME" sleep 5
-
-for i in {1..10}; do
-  if lxc exec "$CONTAINER_NAME" -- ip a | grep -q "inet "; then break; fi
-  sleep 1
-done
-
-lxc config device add "$CONTAINER_NAME" eth0 nic nictype=bridged parent="$BRIDGE_NAME"
-lxc config set "$CONTAINER_NAME" boot.autostart true
-lxc config set "$CONTAINER_NAME" security.privileged true
-
-if [ "$ENABLE_IPV6" = true ]; then
-  lxc exec "$CONTAINER_NAME" -- sh -c "uci set network.lan.ip6assign='64'; uci commit network; /etc/init.d/network restart"
-fi
-
-if [ "$ENABLE_WIFI_SWITCH" = true ]; then
-  echo -e "${YELLOW}[~] 开启 Wi-Fi 热点支持...${NC}"
-  sudo nmcli device wifi hotspot ifname "$BRIDGE_NAME" ssid OpenWrt password 12345678 || echo -e "${RED}[!] 热点创建失败，请手动检查${NC}"
-fi
-
-fi }
-
-select_mode() { echo -e "\n${GREEN}==== 模式选择 ====${NC}" echo "1) 主路由模式" echo "2) 旁路由模式" read -p "请选择: " mode
-
-case $mode in 1) configure_main_router ;; 2) configure_passive_router ;; *) echo -e "${RED}无效选项，默认使用主路由模式${NC}"; configure_main_router ;; esac }
-
-configure_main_router() { local lan_ip="${DEFAULT_SUBNET}.1" echo -e "${YELLOW}[~] 配置主路由 (IP: $lan_ip)...${NC}" lxc exec "$CONTAINER_NAME" -- sh <<EOF uci batch <<EOL set network.lan.proto='static' set network.lan.ipaddr='$lan_ip' set network.lan.netmask='255.255.255.0' set dhcp.lan.start='100' set dhcp.lan.limit='150' set dhcp.lan.leasetime='12h' set firewall.@zone[0].masq='1' EOL /etc/init.d/network restart /etc/init.d/dnsmasq restart EOF echo -e "${GREEN}[✓] 主路由配置完成，访问地址: http://$lan_ip${NC}" }
-
-validate_ip() { [[ $1 =~ ^[0-9]+.[0-9]+.[0-9]+.[0-9]+$ ]] }
-
-configure_passive_router() { while :; do read -p "请输入主路由IP: " main_ip validate_ip "$main_ip" && break echo -e "${RED}无效IP格式，例如: 192.168.1.1${NC}" done
-
-local passive_ip="${main_ip%.*}.2" echo -e "${YELLOW}[~] 配置旁路由 (IP: $passive_ip)...${NC}" lxc exec "$CONTAINER_NAME" -- sh <<EOF uci batch <<EOL set network.lan.proto='static' set network.lan.ipaddr='$passive_ip' set network.lan.netmask='255.255.255.0' set network.lan.gateway='$main_ip' set network.lan.dns='$main_ip' delete dhcp.lan EOL /etc/init.d/network restart EOF echo -e "${GREEN}[✓] 旁路由配置完成，访问地址: http://$passive_ip${NC}" }
-
-create_shortcut() { if [ ! -f "$SHORTCUT" ]; then sudo bash -c "echo -e '#!/bin/bash\n"$(realpath "$0")" "$@"' > "$SHORTCUT"" sudo chmod +x "$SHORTCUT" echo -e "${GREEN}[✓] 已创建快捷方式: ${SHORTCUT}${NC}" fi }
-
-safe_cleanup() { echo -e "${RED}!!! 警告：将永久删除所有数据 !!!${NC}" read -p "确认清理？(输入 YES 确认): " confirm if [ "$confirm" = "YES" ]; then read -p "是否保留快捷方式？[Y/n] " keep [[ "$keep" =~ [nN] ]] && sudo rm -f "$SHORTCUT" && echo -e "${GREEN}[✓] 已删除快捷方式${NC}" lxc stop "$CONTAINER_NAME" --force || true lxc delete "$CONTAINER_NAME" || true lxc image delete "$IMAGE_ALIAS" || true sudo rm -f /etc/netplan/99-openwrt-bridge.yaml && sudo netplan apply rm -rf "$WORKDIR" rm -f "$CONFIG_FILE" echo -e "${GREEN}[✓] 清理完成${NC}" else echo -e "${YELLOW}已取消${NC}" fi }
-
-#================= 容器命令代理 =================
-
-if [[ "$(basename "$0")" = "op" && $# -gt 0 ]]; then lxc exec "$CONTAINER_NAME" -- "$@" exit $? fi
-
-#================= 主菜单 =================
-
-load_config
-
-while true; do echo -e "\n${GREEN}==== OpenWrt 管理 =====" echo "1) 一键部署（首次使用）" echo "2) 切换主路由模式" echo "3) 切换旁路由模式" echo "4) 进入容器控制台" echo "5) 清理环境" echo "6) 切换 IPv6 支持（当前：$([ "$ENABLE_IPV6" = true ] && echo 开启 || echo 关闭)）" echo "7) 切换 Wi-Fi 热点自动切换（当前：$([ "$ENABLE_WIFI_SWITCH" = true ] && echo 开启 || echo 关闭)）" echo "0) 退出" echo -e "=======================${NC}"
-
-read -p "请选择: " choice case $choice in 1) check_dependencies; init_bridge; setup_container; create_shortcut; select_mode ;; 2) configure_main_router ;; 3) configure_passive_router ;; 4) lxc exec "$CONTAINER_NAME" -- su - ;; 5) safe_cleanup ;; 6) ENABLE_IPV6=$([ "$ENABLE_IPV6" = true ] && echo false || echo true); save_config ;; 7) ENABLE_WIFI_SWITCH=$([ "$ENABLE_WIFI_SWITCH" = true ] && echo false || echo true); save_config ;; 0) exit 0 ;; *) echo -e "${RED}无效选项！${NC}" ;; esac done
-
+# 启动菜单
+main_menu
